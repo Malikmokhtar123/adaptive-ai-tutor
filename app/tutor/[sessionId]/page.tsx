@@ -23,6 +23,7 @@ interface TutorState {
   startTime: number;
   lastEvaluation: EvaluationResult | null;
   lastDecision: AdaptiveDecision | null;
+  lastResponseTimeMs: number | null;
   interventionMsg: string | null;
   totalQuestions: number;
   correctCount: number;
@@ -50,12 +51,15 @@ export default function TutorPage() {
     startTime: Date.now(),
     lastEvaluation: null,
     lastDecision: null,
+    lastResponseTimeMs: null,
     interventionMsg: null,
     totalQuestions: 0,
     correctCount: 0,
     streak: 0,
     errorMsg: '',
   });
+
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
   // Load session on mount
   useEffect(() => {
@@ -86,6 +90,16 @@ export default function TutorPage() {
       setTimeout(() => answerRef.current?.focus(), 100);
     }
   }, [state.phase]);
+
+  // Live elapsed-time ticker — only runs during question phase
+  useEffect(() => {
+    if (state.phase !== 'question') return;
+    setElapsedSeconds(0);
+    const interval = setInterval(() => {
+      setElapsedSeconds(Math.floor((Date.now() - state.startTime) / 1000));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [state.phase, state.startTime]);
 
   const handleSubmit = useCallback(async () => {
     if (!state.session || !state.currentQuestion || !state.answer.trim()) return;
@@ -121,6 +135,7 @@ export default function TutorPage() {
         learnerStates: data.learner_states,
         lastEvaluation: data.evaluation,
         lastDecision: data.adaptive_decision,
+        lastResponseTimeMs: responseTime,
         interventionMsg: data.adaptive_decision.intervention_message,
         totalQuestions: s.totalQuestions + 1,
         correctCount: s.correctCount + (wasCorrect ? 1 : 0),
@@ -228,6 +243,15 @@ export default function TutorPage() {
                 style={state.session.current_style}
                 questionType={state.currentQuestion.question_type}
               />
+              {state.phase === 'question' && (
+                <span className={`ml-auto flex-shrink-0 font-mono text-sm px-3 py-1 rounded-lg border ${
+                  elapsedSeconds < 30 ? 'text-success border-success/30 bg-success/10' :
+                  elapsedSeconds < 60 ? 'text-warning border-warning/30 bg-warning/10' :
+                  'text-danger border-danger/30 bg-danger/10'
+                }`}>
+                  ⏱ {Math.floor(elapsedSeconds / 60)}:{String(elapsedSeconds % 60).padStart(2, '0')}
+                </span>
+              )}
             </div>
             <div className="text-white text-base leading-relaxed whitespace-pre-wrap font-mono bg-surface-2/50 rounded-xl p-4 border border-slate-800">
               {state.currentQuestion.question}
@@ -326,6 +350,7 @@ export default function TutorPage() {
             <FeedbackCard
               evaluation={state.lastEvaluation}
               question={state.currentQuestion}
+              responseTimeMs={state.lastResponseTimeMs ?? 0}
               onNext={handleNext}
             />
           )}
@@ -377,12 +402,17 @@ function QuestionMeta({ concept, difficulty, style, questionType }: {
   );
 }
 
-function FeedbackCard({ evaluation, question, onNext }: {
+function FeedbackCard({ evaluation, question, responseTimeMs, onNext }: {
   evaluation: EvaluationResult;
   question: GeneratedQuestion;
+  responseTimeMs: number;
   onNext: () => void;
 }) {
   const [showSteps, setShowSteps] = useState(false);
+  const totalSeconds = Math.round(responseTimeMs / 1000);
+  const timeLabel = totalSeconds < 60
+    ? `${totalSeconds}s`
+    : `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`;
 
   return (
     <div className={`bg-surface rounded-2xl border p-6 space-y-4 ${
@@ -393,11 +423,17 @@ function FeedbackCard({ evaluation, question, onNext }: {
         evaluation.is_correct ? 'bg-success/10' : 'bg-danger/10'
       }`}>
         <span className="text-2xl">{evaluation.is_correct ? '✓' : '✗'}</span>
-        <div>
+        <div className="flex-1">
           <p className={`font-semibold ${evaluation.is_correct ? 'text-success' : 'text-danger'}`}>
             {evaluation.is_correct ? 'Correct!' : 'Not quite'}
           </p>
           <p className="text-sm text-slate-300 mt-0.5">{evaluation.encouragement}</p>
+        </div>
+        <div className="text-right flex-shrink-0">
+          <p className="text-xs text-slate-500">Time taken</p>
+          <p className={`font-mono font-semibold text-sm ${
+            totalSeconds < 30 ? 'text-success' : totalSeconds < 60 ? 'text-warning' : 'text-danger'
+          }`}>⏱ {timeLabel}</p>
         </div>
       </div>
 
