@@ -40,6 +40,7 @@ export default function SetupPage() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to start session');
+      localStorage.setItem(`tutor_${data.session_id}`, JSON.stringify(data.session));
       router.push(`/tutor/${data.session_id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong');

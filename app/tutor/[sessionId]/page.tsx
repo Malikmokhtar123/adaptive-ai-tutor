@@ -5,18 +5,16 @@ import { useParams, useRouter } from 'next/navigation';
 import LearnerSidebar from '@/components/LearnerSidebar';
 import MasteryBar from '@/components/MasteryBar';
 import {
-  Session, Student, LearnerState, GeneratedQuestion,
-  EvaluationResult, AdaptiveDecision, InteractRequest
+  LocalSession, LocalLearnerState,
+  Session, Student, LearnerState,
+  GeneratedQuestion, EvaluationResult, AdaptiveDecision,
 } from '@/types';
 
 type Phase = 'loading' | 'question' | 'submitting' | 'feedback' | 'error';
 
 interface TutorState {
   phase: Phase;
-  session: Session | null;
-  student: Student | null;
-  currentQuestion: GeneratedQuestion | null;
-  learnerStates: LearnerState[];
+  localSession: LocalSession | null;
   answer: string;
   confidence: number;
   hintsRevealed: number;
@@ -31,6 +29,26 @@ interface TutorState {
   errorMsg: string;
 }
 
+// Adapters so existing sidebar/components stay unchanged
+function toSession(ls: LocalSession): Session {
+  return {
+    id: 0, student_id: 0, topic: ls.topic,
+    current_concept: ls.current_concept,
+    current_difficulty: ls.current_difficulty,
+    current_style: ls.current_style,
+    current_question: ls.current_question,
+    status: 'active', started_at: ls.started_at, ended_at: null,
+  };
+}
+function toStudent(ls: LocalSession): Student {
+  return { id: 0, name: ls.student_name, created_at: ls.started_at };
+}
+function toLearnerStates(ls: LocalSession): LearnerState[] {
+  return ls.learner_states.map((lls: LocalLearnerState) => ({
+    id: 0, session_id: 0, updated_at: ls.started_at, ...lls,
+  }));
+}
+
 const CONFIDENCE_LABELS = ['', 'Guessing', 'Unsure', 'Okay', 'Confident', 'Certain'];
 
 export default function TutorPage() {
@@ -41,10 +59,7 @@ export default function TutorPage() {
 
   const [state, setState] = useState<TutorState>({
     phase: 'loading',
-    session: null,
-    student: null,
-    currentQuestion: null,
-    learnerStates: [],
+    localSession: null,
     answer: '',
     confidence: 3,
     hintsRevealed: 0,
@@ -61,27 +76,24 @@ export default function TutorPage() {
 
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
-  // Load session on mount
+  // Load session from localStorage on mount
   useEffect(() => {
-    async function load() {
-      try {
-        const res = await fetch(`/api/session/${sessionId}`);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error);
-        setState(s => ({
-          ...s,
-          phase: 'question',
-          session: data.session,
-          student: data.student,
-          currentQuestion: data.session.current_question,
-          learnerStates: data.learner_states,
-          startTime: Date.now(),
-        }));
-      } catch (err) {
-        setState(s => ({ ...s, phase: 'error', errorMsg: String(err) }));
+    try {
+      const raw = localStorage.getItem(`tutor_${sessionId}`);
+      if (!raw) {
+        setState(s => ({ ...s, phase: 'error', errorMsg: 'Session not found. Please start a new session.' }));
+        return;
       }
+      const localSession: LocalSession = JSON.parse(raw);
+      setState(s => ({
+        ...s,
+        phase: 'question',
+        localSession,
+        startTime: Date.now(),
+      }));
+    } catch {
+      setState(s => ({ ...s, phase: 'error', errorMsg: 'Failed to load session.' }));
     }
-    load();
   }, [sessionId]);
 
   // Auto-focus answer input when question phase starts
@@ -102,37 +114,38 @@ export default function TutorPage() {
   }, [state.phase, state.startTime]);
 
   const handleSubmit = useCallback(async () => {
-    if (!state.session || !state.currentQuestion || !state.answer.trim()) return;
+    const { localSession } = state;
+    if (!localSession || !localSession.current_question || !state.answer.trim()) return;
     const responseTime = Date.now() - state.startTime;
 
     setState(s => ({ ...s, phase: 'submitting' }));
-
-    const body: InteractRequest = {
-      concept: state.currentQuestion.concept,
-      question: state.currentQuestion.question,
-      student_answer: state.answer.trim(),
-      hint_used: state.hintsRevealed > 0,
-      hint_level: state.hintsRevealed,
-      confidence: state.confidence,
-      response_time_ms: responseTime,
-    };
 
     try {
       const res = await fetch(`/api/session/${sessionId}/interact`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          session: localSession,
+          concept: localSession.current_question!.concept,
+          question: localSession.current_question!.question,
+          student_answer: state.answer.trim(),
+          hint_used: state.hintsRevealed > 0,
+          hint_level: state.hintsRevealed,
+          confidence: state.confidence,
+          response_time_ms: responseTime,
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
 
-      const wasCorrect = data.evaluation.is_correct;
+      const updatedSession: LocalSession = data.session;
+      localStorage.setItem(`tutor_${sessionId}`, JSON.stringify(updatedSession));
 
+      const wasCorrect = data.evaluation.is_correct;
       setState(s => ({
         ...s,
         phase: 'feedback',
-        session: data.session,
-        learnerStates: data.learner_states,
+        localSession: updatedSession,
         lastEvaluation: data.evaluation,
         lastDecision: data.adaptive_decision,
         lastResponseTimeMs: responseTime,
@@ -147,11 +160,10 @@ export default function TutorPage() {
   }, [state, sessionId]);
 
   function handleNext() {
-    if (!state.session?.current_question) return;
+    if (!state.localSession?.current_question) return;
     setState(s => ({
       ...s,
       phase: 'question',
-      currentQuestion: s.session!.current_question,
       answer: '',
       confidence: 3,
       hintsRevealed: 0,
@@ -161,7 +173,7 @@ export default function TutorPage() {
   }
 
   function revealHint() {
-    if (state.hintsRevealed < 3 && state.currentQuestion) {
+    if (state.hintsRevealed < 3 && state.localSession?.current_question) {
       setState(s => ({ ...s, hintsRevealed: s.hintsRevealed + 1 }));
     }
   }
@@ -196,9 +208,14 @@ export default function TutorPage() {
     );
   }
 
-  if (!state.session || !state.student || !state.currentQuestion) return null;
+  if (!state.localSession || !state.localSession.current_question) return null;
 
-  const currentLs = state.learnerStates.find(ls => ls.concept === state.session!.current_concept);
+  // Derive UI-compatible types from localSession
+  const session = toSession(state.localSession);
+  const student = toStudent(state.localSession);
+  const learnerStates = toLearnerStates(state.localSession);
+  const currentQuestion = state.localSession.current_question;
+  const currentLs = learnerStates.find(ls => ls.concept === state.localSession!.current_concept);
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -238,10 +255,10 @@ export default function TutorPage() {
           <div className="bg-surface rounded-2xl border border-slate-700 p-6">
             <div className="flex items-center gap-3 mb-4">
               <QuestionMeta
-                concept={state.currentQuestion.concept}
-                difficulty={state.session.current_difficulty}
-                style={state.session.current_style}
-                questionType={state.currentQuestion.question_type}
+                concept={currentQuestion.concept}
+                difficulty={session.current_difficulty}
+                style={session.current_style}
+                questionType={currentQuestion.question_type}
               />
               {state.phase === 'question' && (
                 <span className={`ml-auto flex-shrink-0 font-mono text-sm px-3 py-1 rounded-lg border ${
@@ -254,19 +271,19 @@ export default function TutorPage() {
               )}
             </div>
             <div className="text-white text-base leading-relaxed whitespace-pre-wrap font-mono bg-surface-2/50 rounded-xl p-4 border border-slate-800">
-              {state.currentQuestion.question}
+              {currentQuestion.question}
             </div>
           </div>
 
           {/* Hints */}
-          {state.phase === 'question' && state.currentQuestion.hints && (
+          {state.phase === 'question' && currentQuestion.hints && (
             <div className="bg-surface rounded-2xl border border-slate-700 p-5">
               <div className="flex items-center justify-between mb-3">
                 <p className="text-sm font-medium text-slate-300">Hints</p>
                 <span className="text-xs text-slate-500">{state.hintsRevealed}/3 revealed</span>
               </div>
               <div className="space-y-2">
-                {state.currentQuestion.hints.map((hint, i) => (
+                {currentQuestion.hints.map((hint, i) => (
                   <div key={i} className={`rounded-xl border transition-all overflow-hidden ${
                     state.hintsRevealed > i
                       ? 'border-accent/30 bg-accent/5'
@@ -349,7 +366,7 @@ export default function TutorPage() {
           {state.phase === 'feedback' && state.lastEvaluation && (
             <FeedbackCard
               evaluation={state.lastEvaluation}
-              question={state.currentQuestion}
+              question={currentQuestion}
               responseTimeMs={state.lastResponseTimeMs ?? 0}
               onNext={handleNext}
             />
@@ -358,9 +375,9 @@ export default function TutorPage() {
 
         {/* Right: learner sidebar */}
         <LearnerSidebar
-          session={state.session}
-          student={state.student}
-          learnerStates={state.learnerStates}
+          session={session}
+          student={student}
+          learnerStates={learnerStates}
           lastDecision={state.lastDecision}
           totalQuestions={state.totalQuestions}
           correctCount={state.correctCount}

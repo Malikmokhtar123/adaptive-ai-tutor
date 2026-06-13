@@ -110,3 +110,31 @@ export interface SessionData {
   learner_states: LearnerState[];
   recent_interactions: Interaction[];
 }
+
+// --- Stateless / client-stored session (no DB required) ---
+
+export interface LocalLearnerState {
+  concept: string;
+  mastery_prob: number;
+  attempts: number;
+  correct_count: number;
+  hint_count: number;
+  avg_response_time_ms: number;
+  consecutive_correct: number;
+  consecutive_wrong: number;
+  error_pattern: { conceptual: number; procedural: number; careless: number };
+  style_effectiveness: Partial<Record<Style, number>>;
+}
+
+export interface LocalSession {
+  session_id: string;
+  student_name: string;
+  topic: Topic;
+  current_concept: string;
+  current_difficulty: number;
+  current_style: Style;
+  current_question: GeneratedQuestion | null;
+  learner_states: LocalLearnerState[];
+  recent_questions: string[];
+  started_at: string;
+}

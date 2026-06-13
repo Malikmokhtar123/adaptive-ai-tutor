@@ -1,16 +1,22 @@
 import { NextResponse } from 'next/server';
-import { getDb, toRow } from '@/db/database';
 import { evaluateAnswer, generateQuestion } from '@/lib/groq-client';
 import { updateBKT, updateStyleEffectiveness } from '@/lib/learner-model';
 import { makeAdaptiveDecision } from '@/lib/adaptive-engine';
-import { InteractRequest, Session, LearnerState } from '@/types';
+import { LocalSession, LocalLearnerState, Session, LearnerState } from '@/types';
 
-function parseState(row: Record<string, unknown>): LearnerState {
+function toSession(ls: LocalSession): Session {
   return {
-    ...(row as unknown as LearnerState),
-    error_pattern: JSON.parse(row.error_pattern as string),
-    style_effectiveness: JSON.parse(row.style_effectiveness as string),
+    id: 0, student_id: 0, topic: ls.topic,
+    current_concept: ls.current_concept,
+    current_difficulty: ls.current_difficulty,
+    current_style: ls.current_style,
+    current_question: ls.current_question,
+    status: 'active', started_at: ls.started_at, ended_at: null,
   };
+}
+
+function toLearnerState(lls: LocalLearnerState): LearnerState {
+  return { id: 0, session_id: 0, updated_at: new Date().toISOString(), ...lls };
 }
 
 export async function POST(
@@ -18,26 +24,31 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const { id } = await params;
-    const db = await getDb();
-    const sessionId = parseInt(id);
-    const body = await req.json() as InteractRequest;
+    await params;
+    const body = await req.json() as {
+      session: LocalSession;
+      concept: string;
+      question: string;
+      student_answer: string;
+      hint_used: boolean;
+      hint_level: number;
+      confidence: number;
+      response_time_ms: number;
+    };
 
-    // Load session
-    const sRes = await db.execute({ sql: 'SELECT * FROM sessions WHERE id = ?', args: [sessionId] });
-    if (!sRes.rows[0]) return NextResponse.json({ error: 'Session not found' }, { status: 404 });
-    const session = toRow(sRes.rows[0] as Record<string, unknown>) as unknown as Session;
+    const { session } = body;
 
-    // Init learner state if missing
-    await db.execute({
-      sql: 'INSERT OR IGNORE INTO learner_state (session_id, concept) VALUES (?, ?)',
-      args: [sessionId, body.concept],
-    });
-    const lsRes = await db.execute({
-      sql: 'SELECT * FROM learner_state WHERE session_id = ? AND concept = ?',
-      args: [sessionId, body.concept],
-    });
-    const ls = parseState(toRow(lsRes.rows[0] as Record<string, unknown>));
+    // Find or init learner state for this concept
+    let ls = session.learner_states.find(s => s.concept === body.concept);
+    if (!ls) {
+      ls = {
+        concept: body.concept,
+        mastery_prob: 0.3, attempts: 0, correct_count: 0, hint_count: 0,
+        avg_response_time_ms: 0, consecutive_correct: 0, consecutive_wrong: 0,
+        error_pattern: { conceptual: 0, procedural: 0, careless: 0 },
+        style_effectiveness: {},
+      };
+    }
 
     // Evaluate answer via Groq
     const evaluation = await evaluateAnswer({
@@ -54,9 +65,11 @@ export async function POST(
     if (evaluation.error_type) newErrorPattern[evaluation.error_type]++;
 
     // Update style effectiveness
-    const newStyleEff = updateStyleEffectiveness(ls.style_effectiveness, session.current_style, evaluation.is_correct, body.hint_used);
+    const newStyleEff = updateStyleEffectiveness(
+      ls.style_effectiveness, session.current_style, evaluation.is_correct, body.hint_used
+    );
 
-    // Update running average response time
+    // Running average response time
     const newAvgTime = ls.attempts === 0
       ? body.response_time_ms
       : (ls.avg_response_time_ms * ls.attempts + body.response_time_ms) / (ls.attempts + 1);
@@ -64,42 +77,9 @@ export async function POST(
     const newConsecCorrect = evaluation.is_correct ? ls.consecutive_correct + 1 : 0;
     const newConsecWrong   = evaluation.is_correct ? 0 : ls.consecutive_wrong + 1;
 
-    // Persist interaction
-    await db.execute({
-      sql: `INSERT INTO interactions
-        (session_id, concept, question, student_answer, is_correct, partial_credit,
-         error_type, hint_used, hint_level, confidence, response_time_ms, ai_feedback,
-         difficulty_at_time, style_at_time)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      args: [
-        sessionId, body.concept, body.question, body.student_answer,
-        evaluation.is_correct ? 1 : 0, evaluation.partial_credit, evaluation.error_type,
-        body.hint_used ? 1 : 0, body.hint_level, body.confidence, body.response_time_ms,
-        `${evaluation.feedback} ${evaluation.explanation}`,
-        session.current_difficulty, session.current_style,
-      ],
-    });
-
-    // Update learner state
-    await db.execute({
-      sql: `UPDATE learner_state SET
-        mastery_prob = ?, attempts = ?, correct_count = ?, hint_count = ?,
-        avg_response_time_ms = ?, consecutive_correct = ?, consecutive_wrong = ?,
-        error_pattern = ?, style_effectiveness = ?, updated_at = datetime('now')
-        WHERE session_id = ? AND concept = ?`,
-      args: [
-        newMastery, ls.attempts + 1,
-        ls.correct_count + (evaluation.is_correct ? 1 : 0),
-        ls.hint_count + (body.hint_used ? 1 : 0),
-        newAvgTime, newConsecCorrect, newConsecWrong,
-        JSON.stringify(newErrorPattern), JSON.stringify(newStyleEff),
-        sessionId, body.concept,
-      ],
-    });
-
-    // Adaptive decision
-    const updatedState: LearnerState = {
-      ...ls, mastery_prob: newMastery,
+    const updatedLs: LocalLearnerState = {
+      ...ls,
+      mastery_prob: newMastery,
       attempts: ls.attempts + 1,
       correct_count: ls.correct_count + (evaluation.is_correct ? 1 : 0),
       hint_count: ls.hint_count + (body.hint_used ? 1 : 0),
@@ -109,14 +89,12 @@ export async function POST(
       error_pattern: newErrorPattern,
       style_effectiveness: newStyleEff,
     };
-    const decision = makeAdaptiveDecision(session, updatedState);
 
-    // Recent questions for dedup
-    const rqRes = await db.execute({
-      sql: 'SELECT question FROM interactions WHERE session_id = ? ORDER BY timestamp DESC LIMIT 4',
-      args: [sessionId],
-    });
-    const recentQs = rqRes.rows.map(r => r.question as string);
+    // Adaptive decision
+    const decision = makeAdaptiveDecision(toSession(session), toLearnerState(updatedLs));
+
+    // Recent questions for dedup (keep last 4)
+    const recentQs = [...session.recent_questions.slice(-4), body.question];
 
     // Generate next question
     const nextQuestion = await generateQuestion({
@@ -126,25 +104,24 @@ export async function POST(
       recentQuestions: recentQs,
     });
 
-    // Update session
-    await db.execute({
-      sql: 'UPDATE sessions SET current_concept = ?, current_difficulty = ?, current_style = ?, current_question = ? WHERE id = ?',
-      args: [decision.next_concept, decision.next_difficulty, decision.next_style, JSON.stringify(nextQuestion), sessionId],
-    });
-
-    // Return updated state
-    const allLsRes = await db.execute({ sql: 'SELECT * FROM learner_state WHERE session_id = ?', args: [sessionId] });
-    const allStates = allLsRes.rows.map(r => parseState(toRow(r as Record<string, unknown>)));
-
-    const updSessRes = await db.execute({ sql: 'SELECT * FROM sessions WHERE id = ?', args: [sessionId] });
-    const updatedSession = toRow(updSessRes.rows[0] as Record<string, unknown>);
+    // Build updated session
+    const updatedSession: LocalSession = {
+      ...session,
+      current_concept: decision.next_concept,
+      current_difficulty: decision.next_difficulty,
+      current_style: decision.next_style,
+      current_question: nextQuestion,
+      learner_states: [
+        ...session.learner_states.filter(s => s.concept !== body.concept),
+        updatedLs,
+      ],
+      recent_questions: recentQs,
+    };
 
     return NextResponse.json({
       evaluation,
-      learner_states: allStates,
-      next_question: nextQuestion,
+      session: updatedSession,
       adaptive_decision: decision,
-      session: { ...updatedSession, current_question: nextQuestion },
     });
   } catch (err) {
     console.error('[POST /api/session/[id]/interact]', err);
