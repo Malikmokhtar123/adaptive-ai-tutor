@@ -1,11 +1,11 @@
 import { NextResponse } from 'next/server';
-import { getDb } from '@/db/database';
+import { getDb, toRow } from '@/db/database';
 
-function parseState(ls: Record<string, unknown>) {
+function parseState(row: Record<string, unknown>) {
   return {
-    ...ls,
-    error_pattern: JSON.parse(ls.error_pattern as string),
-    style_effectiveness: JSON.parse(ls.style_effectiveness as string),
+    ...row,
+    error_pattern: JSON.parse(row.error_pattern as string),
+    style_effectiveness: JSON.parse(row.style_effectiveness as string),
   };
 }
 
@@ -15,17 +15,24 @@ export async function GET(
 ) {
   try {
     const { id } = await params;
-    const db = getDb();
+    const db = await getDb();
     const sessionId = parseInt(id);
 
-    const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sessionId) as Record<string, unknown> | undefined;
-    if (!session) return NextResponse.json({ error: 'Session not found' }, { status: 404 });
+    const sRes = await db.execute({ sql: 'SELECT * FROM sessions WHERE id = ?', args: [sessionId] });
+    if (!sRes.rows[0]) return NextResponse.json({ error: 'Session not found' }, { status: 404 });
+    const session = toRow(sRes.rows[0] as Record<string, unknown>);
 
-    const student = db.prepare('SELECT * FROM students WHERE id = ?').get(session.student_id as number);
-    const learnerStates = (db.prepare('SELECT * FROM learner_state WHERE session_id = ?').all(sessionId) as Record<string, unknown>[]).map(parseState);
-    const recentInteractions = db.prepare(
-      'SELECT * FROM interactions WHERE session_id = ? ORDER BY timestamp DESC LIMIT 15'
-    ).all(sessionId);
+    const stuRes = await db.execute({ sql: 'SELECT * FROM students WHERE id = ?', args: [session.student_id as number] });
+    const student = toRow(stuRes.rows[0] as Record<string, unknown>);
+
+    const lsRes = await db.execute({ sql: 'SELECT * FROM learner_state WHERE session_id = ?', args: [sessionId] });
+    const learnerStates = lsRes.rows.map(r => parseState(toRow(r as Record<string, unknown>)));
+
+    const intRes = await db.execute({
+      sql: 'SELECT * FROM interactions WHERE session_id = ? ORDER BY timestamp DESC LIMIT 15',
+      args: [sessionId],
+    });
+    const recentInteractions = intRes.rows.map(r => toRow(r as Record<string, unknown>));
 
     return NextResponse.json({
       session: {
